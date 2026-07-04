@@ -1,0 +1,22 @@
+# DOTOMI-TRADE — Image Docker pour le process Scheduler (scan 24h/24).
+#
+# Volontairement séparée de l'image API : le scheduler n'a pas besoin
+# d'écouter de port HTTP, et l'isoler en process indépendant garantit qu'un
+# redémarrage ou un déploiement de l'API n'interrompt jamais le scan en
+# continu (section 6.1 : robustesse par isolation des composants).
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app ./app
+COPY scripts ./scripts
+
+RUN useradd --create-home --shell /bin/bash dotomi \
+    && chown -R dotomi:dotomi /app
+USER dotomi
+
+CMD ["python", "-m", "app.core.scheduler"]

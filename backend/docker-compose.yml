@@ -1,0 +1,75 @@
+# DOTOMI-TRADE — Orchestration locale/production via Docker Compose.
+#
+# Trois services :
+#   - db        : PostgreSQL + extension TimescaleDB (recommandé en
+#                 production pour les séries temporelles — voir section 2
+#                 du prompt maître). SQLite reste utilisable en changeant
+#                 simplement DATABASE_URL si on préfère rester simple.
+#   - api       : sert l'API REST, répond aux requêtes à la demande.
+#   - scheduler : process séparé qui fait tourner le scan en continu 24h/24,
+#                 indépendant de l'API pour qu'un redémarrage de l'un ne
+#                 coupe pas l'autre (section 6.1 : robustesse par isolation
+#                 des composants).
+#
+# Démarrage : docker compose up -d --build
+# Logs      : docker compose logs -f scheduler
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dotomi_trade
+      POSTGRES_USER: dotomi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+    volumes:
+      - dotomi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dotomi -d dotomi_trade"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://dotomi:${POSTGRES_PASSWORD:-changeme_in_production}@db:5432/dotomi_trade
+      SCHEDULER_ENABLED: "false"  # le scan en continu tourne dans son propre service ci-dessous
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-false}
+      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+    ports:
+      - "8000:8000"
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.scheduler
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://dotomi:${POSTGRES_PASSWORD:-changeme_in_production}@db:5432/dotomi_trade
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-false}
+      TWELVEDATA_API_KEY: ${TWELVEDATA_API_KEY:-}
+
+volumes:
+  dotomi_pgdata:
