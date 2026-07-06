@@ -22,7 +22,7 @@ railway add postgresql   # base de données gratuite
 
 # Variables d'environnement à configurer dans Railway
 DATABASE_URL=postgresql://...  # auto-configuré par Railway
-CORS_ALLOWED_ORIGINS=https://ton-app.vercel.app
+CORS_ALLOWED_ORIGINS=https://dotomi-trade.vercel.app
 SYMBOLS_TO_SCAN=BTCUSDT,ETHUSDT,SOLUSDT
 RISK_PCT_PER_TRADE=1.0
 MAX_DAILY_LOSS_PCT=3.0
