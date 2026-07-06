@@ -1,0 +1,18 @@
+name: DOTOMI Scanner
+on:
+  schedule:
+    - cron: '*/5 7-15 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan BTC
+        run: curl -s "${{ secrets.API_URL }}/scanner?symbol=BTCUSDT&timeframe=1h"
+      - name: Scan ETH
+        run: curl -s "${{ secrets.API_URL }}/scanner?symbol=ETHUSDT&timeframe=1h"
+      - name: Scan SOL
+        run: curl -s "${{ secrets.API_URL }}/scanner?symbol=SOLUSDT&timeframe=1h"
+      - name: Macro update
+        run: curl -s "${{ secrets.API_URL }}/macro"
