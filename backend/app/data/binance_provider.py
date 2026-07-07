@@ -1,10 +1,9 @@
 """
 Market Data Provider — Version corrigée.
 
-CORRECTION CRITIQUE : Binance retourne 451 (bloc géographique) sur Railway/cloud.
-Solution : Bybit comme provider principal, Binance en fallback local uniquement.
-
-Bybit API publique fonctionne depuis tous les serveurs cloud sans restriction.
+PROBLÈME : Binance (451) ET Bybit (403) bloquent Railway (AWS us-east).
+SOLUTION : CryptoCompare API (gratuit, sans clé, aucune restriction géographique).
+Fallback : CoinGecko (gratuit, sans clé).
 """
 
 import logging
@@ -17,98 +16,130 @@ from app.config import settings
 
 logger = logging.getLogger("dotomi.provider")
 
+# CryptoCompare — gratuit, sans clé, aucune restriction cloud
+CRYPTOCOMPARE_BASE = "https://min-api.cryptocompare.com"
+
+# CoinGecko — fallback gratuit
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+
+# Map timeframe → paramètres CryptoCompare
 TIMEFRAME_MAP = {
-    "1m": "1",   "3m": "3",   "5m": "5",   "15m": "15",
-    "30m": "30", "1h": "60",  "4h": "240", "1d": "D",
+    "1m":  ("histominute", 1),
+    "5m":  ("histominute", 5),
+    "15m": ("histominute", 15),
+    "30m": ("histominute", 30),
+    "1h":  ("histohour",   1),
+    "4h":  ("histohour",   4),
+    "1d":  ("histoday",    1),
 }
 
-BYBIT_BASE = "https://api.bybit.com"
-BINANCE_BASE = settings.binance_base_url
+# Map symboles USDT → symboles CryptoCompare
+SYMBOL_MAP = {
+    "BTCUSDT": ("BTC", "USDT"),
+    "ETHUSDT": ("ETH", "USDT"),
+    "SOLUSDT": ("SOL", "USDT"),
+    "BNBUSDT": ("BNB", "USDT"),
+    "AVAXUSDT": ("AVAX", "USDT"),
+}
 
 
 class BinanceProvider:
     """
-    Provider principal : Bybit (pas de bloc cloud).
-    Fallback : Binance (peut être bloqué sur Railway).
+    Provider de données de marché.
+    Source principale : CryptoCompare (aucune restriction géographique).
+    Fallback : CoinGecko.
     """
-    name = "bybit+binance"
+    name = "cryptocompare+coingecko"
 
     def __init__(self):
         self._client = httpx.AsyncClient(
-            timeout=10.0,
-            headers={"User-Agent": "DOTOMI-TRADE/2.0"},
+            timeout=15.0,
+            headers={
+                "User-Agent": "DOTOMI-TRADE/2.0",
+                "Accept": "application/json",
+            },
         )
 
     async def get_ohlcv(
         self, symbol: str, timeframe: str, limit: int = 200
     ) -> pd.DataFrame:
-        """Bybit en priorité, Binance en fallback."""
         try:
-            return await self._bybit_ohlcv(symbol, timeframe, limit)
+            return await self._cryptocompare_ohlcv(symbol, timeframe, limit)
         except Exception as e:
-            logger.warning(f"bybit_failed symbol={symbol}: {e} — fallback Binance")
-            return await self._binance_ohlcv(symbol, timeframe, limit)
+            logger.warning(f"cryptocompare_failed symbol={symbol}: {e} — fallback coingecko")
+            return await self._coingecko_ohlcv(symbol, timeframe, limit)
 
-    async def _bybit_ohlcv(
+    async def _cryptocompare_ohlcv(
         self, symbol: str, timeframe: str, limit: int
     ) -> pd.DataFrame:
         """
-        Bybit V5 API — fonctionne depuis Railway sans restriction.
-        Endpoint : /v5/market/kline
+        CryptoCompare OHLCV — gratuit sans clé, 100 appels/sec.
+        Endpoint : /data/v2/histominute ou histohour ou histoday
         """
-        interval = TIMEFRAME_MAP.get(timeframe, "60")
+        fsym, tsym = SYMBOL_MAP.get(symbol, (symbol.replace("USDT", ""), "USDT"))
+        endpoint, aggregate = TIMEFRAME_MAP.get(timeframe, ("histohour", 1))
+
         resp = await self._client.get(
-            f"{BYBIT_BASE}/v5/market/kline",
+            f"{CRYPTOCOMPARE_BASE}/data/v2/{endpoint}",
             params={
-                "category": "linear",
-                "symbol":   symbol,
-                "interval": interval,
-                "limit":    limit,
+                "fsym":      fsym,
+                "tsym":      tsym,
+                "limit":     min(limit, 2000),
+                "aggregate": aggregate,
             },
         )
         resp.raise_for_status()
         data = resp.json()
 
-        if data.get("retCode") != 0:
-            raise ValueError(f"Bybit error: {data.get('retMsg')}")
+        if data.get("Response") != "Success":
+            raise ValueError(f"CryptoCompare error: {data.get('Message')}")
 
         rows = []
-        for k in reversed(data["result"]["list"]):
-            # Bybit format: [startTime, open, high, low, close, volume, turnover]
+        for k in data["Data"]["Data"]:
+            if k["open"] == 0 and k["close"] == 0:
+                continue
             rows.append({
-                "timestamp": datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc),
-                "open":      float(k[1]),
-                "high":      float(k[2]),
-                "low":       float(k[3]),
-                "close":     float(k[4]),
-                "volume":    float(k[5]),
+                "timestamp": datetime.fromtimestamp(k["time"], tz=timezone.utc),
+                "open":      float(k["open"]),
+                "high":      float(k["high"]),
+                "low":       float(k["low"]),
+                "close":     float(k["close"]),
+                "volume":    float(k["volumefrom"]),
             })
+
+        if not rows:
+            raise ValueError("CryptoCompare retourné 0 bougies valides")
 
         df = pd.DataFrame(rows)
         df.sort_values("timestamp", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
 
-    async def _binance_ohlcv(
+    async def _coingecko_ohlcv(
         self, symbol: str, timeframe: str, limit: int
     ) -> pd.DataFrame:
-        """Binance — fallback (peut être bloqué sur Railway)."""
-        tf = timeframe  # Binance utilise "1h", "4h", etc.
+        """
+        CoinGecko OHLCV — fallback gratuit.
+        Résolution : 1h pour les 2 derniers jours, 4h pour 90 jours.
+        """
+        coin_map = {
+            "BTCUSDT": "bitcoin",
+            "ETHUSDT": "ethereum",
+            "SOLUSDT": "solana",
+            "BNBUSDT": "binancecoin",
+            "AVAXUSDT": "avalanche-2",
+        }
+        coin_id = coin_map.get(symbol, "bitcoin")
 
-        try:
-            resp = await self._client.get(
-                f"{BINANCE_BASE}/fapi/v1/klines",
-                params={"symbol": symbol, "interval": tf, "limit": limit},
-            )
-            resp.raise_for_status()
-            raw = resp.json()
-        except Exception:
-            resp = await self._client.get(
-                f"{BINANCE_BASE}/api/v3/klines",
-                params={"symbol": symbol, "interval": tf, "limit": limit},
-            )
-            resp.raise_for_status()
-            raw = resp.json()
+        # CoinGecko retourne des bougies sur une période
+        days = 7 if timeframe in ("1m", "5m", "15m", "30m") else 30
+
+        resp = await self._client.get(
+            f"{COINGECKO_BASE}/coins/{coin_id}/ohlc",
+            params={"vs_currency": "usd", "days": days},
+        )
+        resp.raise_for_status()
+        raw = resp.json()
 
         rows = []
         for k in raw:
@@ -118,8 +149,11 @@ class BinanceProvider:
                 "high":      float(k[2]),
                 "low":       float(k[3]),
                 "close":     float(k[4]),
-                "volume":    float(k[5]),
+                "volume":    0.0,
             })
+
+        if not rows:
+            raise ValueError("CoinGecko retourné 0 bougies")
 
         df = pd.DataFrame(rows)
         df.sort_values("timestamp", inplace=True)
@@ -127,40 +161,39 @@ class BinanceProvider:
         return df
 
     async def get_funding_rate(self, symbol: str) -> float | None:
-        """Funding rate via Bybit (sans restriction cloud)."""
+        """
+        Funding rate via CoinGlass API publique (sans clé).
+        Fallback : retourne 0.0 (neutre).
+        """
         try:
+            # CoinGlass endpoint public
+            fsym = symbol.replace("USDT", "")
             resp = await self._client.get(
-                f"{BYBIT_BASE}/v5/market/tickers",
-                params={"category": "linear", "symbol": symbol},
+                "https://open-api.coinglass.com/public/v2/funding",
+                params={"symbol": fsym},
             )
             resp.raise_for_status()
-            lst = resp.json().get("result", {}).get("list", [])
-            if lst:
-                return float(lst[0].get("fundingRate", 0)) * 100
+            data = resp.json()
+            # Cherche Binance dans la liste
+            for item in data.get("data", []):
+                if item.get("exchangeName") in ("Binance", "Bybit"):
+                    return float(item.get("rate", 0)) * 100
         except Exception as e:
-            logger.warning(f"bybit_funding_failed symbol={symbol}: {e}")
-        return None
+            logger.debug(f"funding_rate_failed symbol={symbol}: {e}")
+        return 0.0
 
     async def get_open_interest(self, symbol: str) -> float | None:
-        """Open interest via Bybit."""
-        try:
-            resp = await self._client.get(
-                f"{BYBIT_BASE}/v5/market/open-interest",
-                params={"category": "linear", "symbol": symbol, "intervalTime": "1h", "limit": 1},
-            )
-            resp.raise_for_status()
-            lst = resp.json().get("result", {}).get("list", [])
-            if lst:
-                return float(lst[0].get("openInterest", 0))
-        except Exception as e:
-            logger.warning(f"bybit_oi_failed symbol={symbol}: {e}")
         return None
 
     async def health_check(self) -> bool:
-        """Health check via Bybit (toujours accessible)."""
+        """Health check via CryptoCompare — toujours accessible."""
         try:
-            resp = await self._client.get(f"{BYBIT_BASE}/v5/market/time")
-            return resp.status_code == 200
+            resp = await self._client.get(
+                f"{CRYPTOCOMPARE_BASE}/data/v2/histohour",
+                params={"fsym": "BTC", "tsym": "USDT", "limit": 1},
+            )
+            data = resp.json()
+            return data.get("Response") == "Success"
         except Exception:
             return False
 
